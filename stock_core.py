@@ -366,6 +366,85 @@ def _to_number(v):
 # ==================================================================================
 # 2. ANALYSIS
 # ==================================================================================
+# ---------- splitting "Amoxicillin 250mg capsule" into name / strength / form ----------
+_UNIT = r"(?:mg|mcg|µg|μg|g|kg|ml|l|iu|%|meq|mmol|million\s*iu|actuations?)"
+STRENGTH_RE = re.compile(
+    r"\d[\d,]*(?:\.\d+)?\s*" + _UNIT + r"(?:\s*/\s*(?:\d+(?:\.\d+)?\s*)?(?:ml|l|g|actuation|dose))?(?![a-z])"
+    r"|\d+\s*:\s*[\d,]+"                       # 1:80,000   30:70
+    r"|\b1\s+in\s+[\d,]+",                     # 1 in 200,000
+    re.I)
+FORM_RE = re.compile(
+    r"\b(tablets?|capsules?|injection|inj|infusion|powder|cream|ointment|syrup|solution|suspension|drops?|"
+    r"eye|nasal|gel|inhaler|inhalation|suppository|spray|pump|sachet|paste|crystal|lotion|jar|packet|bottle|"
+    r"vial|ampoule|pre-filled|respiratory|cartridge|w/w|sustained|extended|enteric|chewable|retard|"
+    r"dried|vaginal|viginal|sublingual|intradermal|plastic|preservative)\b", re.I)
+
+
+def _in_brackets(text, m):
+    return text[:m.start()].rstrip().endswith("(") and text[m.end():].lstrip().startswith(")")
+
+
+def split_item(name: str) -> tuple[str, str, str]:
+    """Return (medicine name, strength, form) from an e-BMSIS item description.
+
+    'Amoxicillin 250mg capsule'                      -> ('Amoxicillin', '250mg', 'capsule')
+    'Lignocaine 2% + Adrenaline 1:80,000 injection'  -> ('Lignocaine + Adrenaline', '2% + 1:80,000', 'injection')
+    'Morphine 10mg/ml (1mL) injection ampoule'       -> ('Morphine', '10mg/ml', '(1mL) injection ampoule')
+    """
+    s = re.sub(r"\s+", " ", name).strip()
+    form_at = len(s)
+    for m in FORM_RE.finditer(s):
+        if m.start() == 0 or s[:m.start()].rstrip().lower().endswith(" for"):   # "Water for injection"
+            continue
+        form_at = m.start()
+        break
+    head, form = s[:form_at], s[form_at:]
+
+    ms = list(STRENGTH_RE.finditer(head))
+    name_parts, strengths, tail_from = [head], [], len(head)
+    if ms:
+        name_parts = [head[:ms[0].start()]]
+        tail_from = ms[0].start()
+        for i, m in enumerate(ms):
+            if _in_brackets(head, m):                     # "(1mL)", "(200 actuations)" = pack size
+                tail_from = head.rfind("(", 0, m.start())
+                if i == 0:
+                    name_parts = [head[:tail_from]]
+                break
+            strengths.append(m.group().strip())
+            tail_from = m.end()
+            if i + 1 < len(ms):
+                between = head[m.end():ms[i + 1].start()]
+                if "(" in between or ")" in between:       # "(equivalent to 500mg ...)" -> description
+                    break
+                if between.strip(" ,"):
+                    name_parts.append(between)
+                tail_from = ms[i + 1].start()
+    tail = head[tail_from:] if ms else ""
+    nm = " ".join(name_parts)
+    nm = re.sub(r"\s*\+\s*(\+\s*)*", " + ", nm)
+    nm = re.sub(r"\s+", " ", nm).strip(" +,-")
+    if nm.count("(") > nm.count(")"):
+        nm = nm.rstrip() + ")"
+    nm = nm.replace("( ", "(").replace(" )", ")")
+    form = re.sub(r"\s+", " ", (tail + " " + form)).strip(" ,")
+    if form.startswith(")") and nm.endswith(")"):
+        form = form[1:].strip()
+    if not strengths:              # e.g. "Glycerin suppository 4g": strength written after the form
+        strengths = [m.group().strip() for m in STRENGTH_RE.finditer(form) if not _in_brackets(form, m)][:1]
+    return nm or s, " + ".join(strengths), form
+
+
+def dosage_text(strength: str, form: str) -> str:
+    if strength and strength.replace(" ", "").lower() in form.replace(" ", "").lower():
+        return form                              # "suppository 4g", not "4g suppository 4g"
+    return (strength + " " + form).strip()
+
+
+def name_key(medicine_name: str) -> str:
+    return re.sub(r"[^a-z0-9+]", "", medicine_name.lower())
+
+
 def medicine_key(name: str) -> str:
     """Key for 'same medicine + same dosage'.
 
@@ -381,6 +460,39 @@ def medicine_key(name: str) -> str:
     return s
 
 
+FORM_WORDS = r"(tablets?|capsules?|injection|inj|syrup|suspension|cream|ointment|powder|solution|drops?|gel|" \
+             r"inhaler|inhalation|suppository|sachet|spray|crystal|paste|lotion|respiratory|vial|ampoule|" \
+             r"infusion|pump|eye|nasal|viginal|vaginal|enteric|soluble|sustained|extended|retard|chewable)"
+
+
+def split_name_dosage(item: str) -> tuple[str, str]:
+    """'Amoxicillin 250mg capsule' -> ('Amoxicillin', '250mg capsule').
+
+    The medicine name is the text before the first strength (a number) or dosage form word.
+    Used to show 'same name, different dosage' – it does NOT decide duplicates;
+    duplicates are always the full Item Name (name + dosage) repeated.
+    """
+    words = item.split()
+    cut = len(words)
+    depth = 0                       # inside brackets? e.g. "Thiamine (vitamin B1)" – keep it in the name
+    for i, w in enumerate(words):
+        before = depth
+        depth = max(0, depth + w.count("(") - w.count(")"))
+        if i == 0 or before > 0:
+            continue
+        lw = w.lower().strip(",:;()")
+        if re.search(r"\d", w) or re.fullmatch(FORM_WORDS, lw):
+            if lw == "injection" and words[i - 1].lower() == "for":   # "Water for injection"
+                continue
+            cut = i
+            break
+    name = " ".join(words[:cut])
+    name = re.sub(r"\s*\([^)]*$", "", name)          # drop an unclosed "(" left by the cut
+    name = name.rstrip(" ,;:+-/(").strip() or item
+    dosage = " ".join(words[cut:]).strip()
+    return name, dosage
+
+
 def _norm_batch(b) -> str:
     return re.sub(r"[^a-z0-9]", "", str(b).lower())
 
@@ -391,8 +503,16 @@ def analyse(df: pd.DataFrame, report_date: date, low_months: float = 1.0,
     today = pd.Timestamp(report_date)
     df["days_to_expiry"] = (df["expiry"] - today).dt.days
     df["expiry_status"] = df["days_to_expiry"].map(_expiry_status)
-    df["med_key"] = df["item_name"].map(medicine_key)
+    df["med_key"] = df["item_name"].map(medicine_key)          # name + dosage  -> decides duplicates
     df["batch_key"] = df["batch"].map(_norm_batch)
+    # split_item keeps combinations together ("Amoxicillin + Clavulanic acid"), so they are not
+    # shown as another dosage of the single medicine
+    split = df["item_name"].map(split_item)
+    df["medicine"] = split.str[0]
+    df["strength"] = split.str[1]
+    df["form"] = split.str[2]
+    df["dosage"] = [dosage_text(s, f) for s, f in zip(df["strength"], df["form"])]
+    df["name_key"] = df["medicine"].map(name_key)
 
     # ---------------- duplicates ----------------
     df["duplicate_finding"] = ""
@@ -419,6 +539,40 @@ def analyse(df: pd.DataFrame, report_date: date, low_months: float = 1.0,
     dups = df[df["duplicate_finding"] != ""].copy()
     dups["action"] = dups.apply(_dup_action, axis=1)
     dups = dups.sort_values(["group_id", "row_no"])
+
+    # one row per duplicated medicine + dosage
+    def _main_finding(fs):
+        for f in FINDING_ORDER:
+            if f in set(fs):
+                return f
+    dup_summary = (dups.groupby("med_key", sort=False)
+                   .agg(medicine=("medicine", "first"), dosage=("dosage", "first"),
+                        item_name=("item_name", "first"), lines=("row_no", "size"),
+                        batches=("batch_key", "nunique"),
+                        supply_types=("supply_type", lambda s: ", ".join(sorted(set(s)))),
+                        rows=("row_no", lambda s: ", ".join(map(str, s))),
+                        finding=("duplicate_finding", _main_finding),
+                        expired_lines=("expiry_status", lambda s: int((s == EXPIRED).sum())))
+                   .reset_index(drop=True))
+    dup_summary["extra_lines"] = dup_summary["lines"] - 1
+    dup_summary = dup_summary[["medicine", "dosage", "lines", "extra_lines", "batches", "supply_types",
+                               "finding", "expired_lines", "rows", "item_name"]] \
+        .sort_values(["finding", "medicine"], key=lambda c: c.map(FINDING_ORDER.index) if c.name == "finding" else c)
+
+    # same medicine name with different dosages (NOT duplicates – shown for information)
+    per_name = df.groupby("name_key").agg(medicine=("medicine", "first"),
+                                          dosages=("med_key", "nunique"), lines=("row_no", "size"))
+    multi = per_name[per_name["dosages"] > 1]
+    name_dosage = []
+    for key, r in multi.iterrows():
+        sub = df[df["name_key"] == key]
+        for mk, g in sub.groupby("med_key", sort=False):
+            name_dosage.append({"medicine": r["medicine"], "dosage": g["dosage"].iloc[0],
+                                "item_name": g["item_name"].iloc[0], "lines": len(g),
+                                "duplicated": "Yes – same dosage repeated" if len(g) > 1 else "No",
+                                "rows": ", ".join(map(str, g["row_no"]))})
+    name_dosage = pd.DataFrame(name_dosage, columns=["medicine", "dosage", "item_name", "lines",
+                                                     "duplicated", "rows"])
 
     # ---------------- expiry ----------------
     expiry = df[df["expiry_status"].isin([EXPIRED, EXP_3M, EXP_6M])].copy()
@@ -456,8 +610,12 @@ def analyse(df: pd.DataFrame, report_date: date, low_months: float = 1.0,
 
     summary = {
         "lines": len(df),
+        "medicine_names": df["name_key"].nunique(),
         "medicines": df["med_key"].nunique(),
+        "names_multi_dosage": len(multi),
         "medicines_repeated": len(dup_keys),
+        "dup_lines": len(dups),
+        "extra_lines": len(dups) - len(dup_keys),
         "dup_counts": {f: int((df["duplicate_finding"] == f).sum()) for f in FINDING_ORDER},
         "expiry_counts": {s: int((df["expiry_status"] == s).sum()) for s in [EXPIRED, EXP_3M, EXP_6M, EXP_OK]},
         "has_qty": has_qty,
@@ -465,7 +623,8 @@ def analyse(df: pd.DataFrame, report_date: date, low_months: float = 1.0,
         "bad_received": int(_received_mismatch(df).sum()),
     }
     df["received_batch_differs"] = _received_mismatch(df)
-    return {"all": df, "duplicates": dups, "expiry": expiry, "stock": stock, "summary": summary}
+    return {"all": df, "duplicates": dups, "dup_summary": dup_summary, "name_dosage": name_dosage,
+            "expiry": expiry, "stock": stock, "summary": summary}
 
 
 def _expiry_status(days):
@@ -513,94 +672,8 @@ def _received_mismatch(df):
 
 
 # ==================================================================================
-# 3. EXCEL REPORT
+# 3. REPORTS  (Excel, PDF and interactive HTML live in reports.py)
 # ==================================================================================
 def excel_report(res: dict, report_date: date, facility: str = "") -> bytes:
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
-
-    s = res["summary"]
-    buf = io.BytesIO()
-    show = {
-        "row_no": "Row #", "supply_type": "Supply Type", "item_name": "Item Name", "batch": "Batch No.",
-        "expiry": "Expiry Date", "days_to_expiry": "Days to Expiry", "expiry_status": "Expiry Status",
-        "balance_qty": "Balance Qty", "duplicate_finding": "Duplicate Finding", "group_id": "Group",
-        "action": "What to do", "received_batch": "Received Batch (as printed)",
-    }
-
-    def tidy(d, cols):
-        cols = [c for c in cols if c in d.columns and not (c == "balance_qty" and not s["has_qty"])]
-        d = d[cols].rename(columns=show)
-        if "Expiry Date" in d:
-            d["Expiry Date"] = d["Expiry Date"].dt.date
-        return d
-
-    summary_rows = [
-        ["Medicine Stock Review" + (f" – {facility}" if facility else ""), ""],
-        ["Report date", report_date.strftime("%d/%m/%Y")],
-        ["", ""],
-        ["Stock lines in report", s["lines"]],
-        ["Distinct medicines (name + dosage)", s["medicines"]],
-        ["Medicines listed more than once", s["medicines_repeated"]],
-        ["", ""], ["DUPLICATE FINDINGS (lines)", ""],
-        *[[k, v] for k, v in s["dup_counts"].items()],
-        ["", ""], ["EXPIRY STATUS (lines)", ""],
-        *[[k, v] for k, v in s["expiry_counts"].items()],
-    ]
-    if s["has_qty"]:
-        summary_rows += [["", ""], ["STOCK LEVEL (medicines)", ""],
-                         *[[k[2:], v] for k, v in sorted(s["stock_counts"].items())]]
-    else:
-        summary_rows += [["", ""], ["Note", "No Balance Qty column in the upload, so stock levels were not checked."]]
-    summary_rows += [["", ""], ["Rule", "Same name + same dosage = duplicate. Same name with different dosage = separate medicine."]]
-
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        pd.DataFrame(summary_rows).to_excel(xw, sheet_name="Summary", index=False, header=False)
-        tidy(res["duplicates"], ["group_id", "item_name", "row_no", "supply_type", "batch", "expiry",
-                                  "expiry_status", "balance_qty", "duplicate_finding", "action"]
-             ).to_excel(xw, sheet_name="Duplicates", index=False)
-        tidy(res["expiry"], ["row_no", "item_name", "batch", "supply_type", "expiry", "days_to_expiry",
-                              "expiry_status", "balance_qty", "action"]).to_excel(xw, sheet_name="Expiry Alerts", index=False)
-        if res["stock"] is not None:
-            st = res["stock"].copy()
-            st["stock_status"] = st["stock_status"].str[2:]
-            st.rename(columns={"item_name": "Medicine (name + dosage)", "balance_qty": "Usable Balance Qty",
-                               "expired_qty": "Expired Qty", "monthly_use": "Monthly Use",
-                               "months_of_stock": "Months of Stock", "stock_status": "Stock Status",
-                               "rows": "Rows"}).to_excel(xw, sheet_name="Stock Level", index=False)
-        tidy(res["all"], ["row_no", "supply_type", "item_name", "batch", "expiry", "days_to_expiry",
-                           "expiry_status", "balance_qty", "duplicate_finding", "received_batch"]
-             ).to_excel(xw, sheet_name="All Items", index=False)
-
-        hdr_fill = PatternFill("solid", fgColor="1F4E78")
-        fills = {EXPIRED: "F8CBAD", EXP_3M: "FCE4D6", EXP_6M: "FFF2CC"}
-        for ws in xw.book.worksheets:
-            for row in ws.iter_rows():
-                for c in row:
-                    c.font = Font(name="Arial", size=10)
-                    c.alignment = Alignment(wrap_text=True, vertical="top")
-            if ws.title == "Summary":
-                ws.column_dimensions["A"].width = 40
-                ws.column_dimensions["B"].width = 70
-                ws["A1"].font = Font(name="Arial", bold=True, size=13)
-                for row in ws.iter_rows():
-                    if row[0].value and str(row[0].value).isupper():
-                        row[0].font = Font(name="Arial", bold=True, color="1F4E78")
-                continue
-            for c in ws[1]:
-                c.font = Font(name="Arial", bold=True, color="FFFFFF")
-                c.fill = hdr_fill
-            ws.freeze_panes = "A2"
-            ws.auto_filter.ref = ws.dimensions
-            for i, c in enumerate(ws[1], 1):
-                width = {"Item Name": 46, "Medicine (name + dosage)": 46, "What to do": 60,
-                         "Duplicate Finding": 30, "Batch No.": 26}.get(c.value, 14)
-                ws.column_dimensions[get_column_letter(i)].width = width
-            heads = [c.value for c in ws[1]]
-            if "Expiry Status" in heads:
-                col = heads.index("Expiry Status")
-                for row in ws.iter_rows(min_row=2):
-                    f = fills.get(row[col].value)
-                    if f:
-                        row[col].fill = PatternFill("solid", fgColor=f)
-    return buf.getvalue()
+    import reports
+    return reports.excel_report(res, report_date, facility)
