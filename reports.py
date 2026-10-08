@@ -89,7 +89,17 @@ def build_content(res: dict, report_date: date, facility: str = "") -> dict:
         ("expiry_status", "Expiry Status"), ("balance_qty", "Balance Qty"),
         ("duplicate_finding", "Duplicate Finding")])
 
+    exact = _problem_list(res["duplicates"], [sc.EXACT_DUP]).drop(columns="Finding")
+    check = _problem_list(res["duplicates"], [sc.SAME_BATCH_TYPES, sc.EXPIRY_CONFLICT])
+    sections[1][1].insert(0, ("Exact duplicate medicines", len(exact),
+                              f"See Exact Duplicates list – {int(exact['Copies'].sum() - len(exact)) if len(exact) else 0} extra lines to remove"))
+    sections[1][1].insert(1, ("Other entries to check", len(check), "See Other Entries to Check list"))
+
     tables = [
+        ("Exact Duplicates", "Medicines whose same dosage, batch, expiry and supply type are entered more than "
+         "once. Keep one line and remove the extra copies in e-BMSIS.", exact),
+        ("Other Entries to Check", "Same batch entered under two supply types, or with two different expiry "
+         "dates. Check the receipts and the pack, then correct e-BMSIS.", check),
         ("Duplicate Summary", "One row per medicine + dosage that is listed more than once.", dup_sum),
         ("Duplicate Detail", "Every line of the duplicated items, with what to do.", dup_detail),
         ("Same Name, Different Dosage", "Medicines stocked in more than one dosage. "
@@ -108,6 +118,31 @@ def build_content(res: dict, report_date: date, facility: str = "") -> dict:
     title = "Medicine Stock Review" + (f" – {facility}" if facility else "")
     return {"title": title, "date": report_date.strftime("%d/%m/%Y"), "sections": sections,
             "notes": notes, "tables": tables}
+
+
+def _problem_list(dups: pd.DataFrame, findings: list[str]) -> pd.DataFrame:
+    """One row per medicine + dosage + batch that has the given problem finding(s)."""
+    cols = ["Finding", "Medicine", "Dosage", "Batch No.", "Expiry Date(s)", "Supply Type(s)", "Copies",
+            "Rows", "What to do"]
+    sub = dups[dups["duplicate_finding"].isin(findings)]
+    if sub.empty:
+        return pd.DataFrame(columns=cols)
+    out = []
+    for (_, _, f), g in sub.groupby(["med_key", "batch_key", "duplicate_finding"], sort=False):
+        out.append({
+            "Finding": f, "Medicine": g["medicine"].iloc[0], "Dosage": g["dosage"].iloc[0],
+            "Batch No.": g["batch"].iloc[0],
+            "Expiry Date(s)": ", ".join(sorted({d.strftime("%d/%m/%Y") for d in g["expiry"].dropna()})),
+            "Supply Type(s)": ", ".join(sorted(set(g["supply_type"]))),
+            "Copies": len(g), "Rows": ", ".join(str(r) for r in g["row_no"]),
+            "What to do": {sc.EXACT_DUP: f"Keep 1 line, remove {len(g) - 1} extra.",
+                           sc.SAME_BATCH_TYPES: "Confirm two receipts, else merge into one line.",
+                           sc.EXPIRY_CONFLICT: "Check the pack and correct the wrong expiry date."}[f],
+        })
+    df = pd.DataFrame(out, columns=cols)
+    order = {f: i for i, f in enumerate([sc.EXACT_DUP, sc.EXPIRY_CONFLICT, sc.SAME_BATCH_TYPES])}
+    return df.sort_values(["Finding", "Medicine"], key=lambda c: c.map(order) if c.name == "Finding" else c
+                          ).reset_index(drop=True)
 
 
 def _cell(v):
@@ -130,7 +165,7 @@ def excel_report(res: dict, report_date: date, facility: str = "") -> bytes:
 
     c = build_content(res, report_date, facility)
     buf = io.BytesIO()
-    widths = {"Medicine": 30, "Dosage": 36, "Item (medicine + dosage)": 46, "What to do": 55,
+    widths = {"Expiry Date(s)": 22, "Supply Type(s)": 18, "Medicine": 30, "Dosage": 36, "Item (medicine + dosage)": 46, "What to do": 55,
               "Finding": 30, "Main Finding": 30, "Duplicate Finding": 30, "Batch No.": 24,
               "Supply Types": 18, "Rows": 14, "Expiry Status": 17, "Duplicated?": 24}
     head_fill = PatternFill("solid", fgColor="1F4E78")
@@ -253,7 +288,8 @@ def pdf_report(res: dict, report_date: date, facility: str = "", include_all_ite
               "Finding": 2.3, "Main Finding": 2.3, "Duplicate Finding": 2.3, "Batch No.": 2.0,
               "Supply Types": 1.5, "Supply Type": 1.1, "Rows": 1.3, "Expiry Status": 1.4,
               "Expiry Date": 1.1, "Duplicated?": 1.8, "Row #": 0.6, "Group": 0.6, "Lines": 0.6,
-              "Extra Lines": 0.7, "Batches": 0.7, "Expired Lines": 0.8, "Days Left": 0.8}
+              "Extra Lines": 0.7, "Batches": 0.7, "Expired Lines": 0.8, "Days Left": 0.8,
+              "Expiry Date(s)": 1.5, "Supply Type(s)": 1.4, "Copies": 0.8}
     for name, desc, df in c["tables"]:
         if name == "All Items" and not include_all_items:
             continue
@@ -334,7 +370,7 @@ header{background:var(--blue);color:#fff;padding:18px 24px}
 header h1{margin:0;font-size:21px;font-weight:650}
 header p{margin:4px 0 0;opacity:.85;font-size:13px}
 main{max-width:1280px;margin:0 auto;padding:18px 16px 40px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(138px,1fr));gap:10px;margin-bottom:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .card .v{font-size:26px;font-weight:700;color:var(--blue)}
 .card .l{font-size:12.5px;color:var(--muted)}
@@ -400,7 +436,7 @@ const flat = {}; D.sections.forEach(([n, rows]) => rows.forEach(([l, v]) => flat
 const cards = [["Stock lines in the report","Stock lines"],["Medicine names","Medicine names"],
   ["Total items (medicine + dosage)","Total items (medicine + dosage)"],
   ["Medicines with more than one dosage","Medicines with several dosages"],
-  ["Items listed more than once","Duplicated items",1],["EXPIRED","Expired lines",1],["Expires ≤3 months","Expiring ≤3 months",1]];
+  ["Items listed more than once","Duplicated items",1],["Exact duplicate medicines","Exact duplicate medicines",1],["EXPIRED","Expired lines",1],["Expires ≤3 months","Expiring ≤3 months",1]];
 $("cards").innerHTML = cards.filter(c => c[0] in flat).map(([k,l,w]) =>
   `<div class="card${w && flat[k] ? " warn":""}"><div class="v">${flat[k]}</div><div class="l">${esc(l)}</div></div>`).join("");
 

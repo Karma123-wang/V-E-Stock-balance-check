@@ -15,12 +15,18 @@ import streamlit as st
 
 import reports as rp
 import stock_core as sc
+import ui
 
 st.set_page_config(page_title="Medicine Stock Review", page_icon="💊", layout="wide")
+st.markdown(ui.CSS, unsafe_allow_html=True)
+
+
+def html(s: str):
+    st.markdown(s, unsafe_allow_html=True)
 
 
 # ----------------------------------------------------------------------------------
-# Cached readers (so changing a setting doesn't re-read the PDFs)
+# Cached readers (so changing a setting doesn't re-read the files)
 # ----------------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def read_pdf(name: str, data: bytes) -> pd.DataFrame:
@@ -48,30 +54,34 @@ FIELD_LABELS = {
 # Sidebar
 # ----------------------------------------------------------------------------------
 with st.sidebar:
-    st.header("Settings")
-    facility = st.text_input("Facility name", value="")
-    report_date = st.date_input("Report date (expiry is checked against this)", value=date.today(),
-                                format="DD/MM/YYYY")
-    st.markdown("**Stock level limits** (used only when a monthly-use column is uploaded)")
-    low_months = st.number_input("Low stock if less than … months of stock", 0.0, 24.0, 1.0, 0.5)
-    over_months = st.number_input("Overstock if more than … months of stock", 1.0, 60.0, 12.0, 1.0)
+    st.markdown("### Settings")
+    facility = st.text_input("Facility name", value="", placeholder="e.g. Tsirang Hospital")
+    report_date = st.date_input("Report date", value=date.today(), format="DD/MM/YYYY",
+                                help="Expiry is checked against this date.")
+    st.markdown("**Stock level limits**")
+    st.caption("Used only when the upload has an average monthly use (AMC) column.")
+    low_months = st.number_input("Low stock: less than … months", 0.0, 24.0, 1.0, 0.5)
+    over_months = st.number_input("Overstock: more than … months", 1.0, 60.0, 12.0, 1.0)
     st.divider()
-    st.caption("**Duplicate rule:** same medicine name **and** same dosage on more than one line. "
-               "The same medicine with a different dosage (e.g. Amoxicillin 250mg and 500mg capsule) "
-               "is counted as a separate item, not a duplicate.")
+    st.caption("**Duplicate rule:** the same medicine name **and** the same dosage on more than one line. "
+               "The same medicine in a different dosage (e.g. Amoxicillin 250mg and 1000mg capsule) "
+               "is a separate item, not a duplicate.")
+
+head = st.empty()
+TITLE = "Medicine Stock Review"
+SUB = "e-BMSIS stock balance: duplicates, expiry and stock levels"
 
 # ----------------------------------------------------------------------------------
 # Upload
 # ----------------------------------------------------------------------------------
-st.title("💊 Medicine Stock Review")
-st.write("Upload the e-BMSIS **View Stock Balance** report. You can upload all PDF pages at once "
-         "(e.g. 1–100, 101–200 …) or a single Excel/CSV export.")
-
-files = st.file_uploader("Stock balance file(s)", type=["pdf", "xlsx", "xls", "csv"],
-                         accept_multiple_files=True)
+files = st.file_uploader("Upload the View Stock Balance report (PDF pages, Excel or CSV)",
+                         type=["pdf", "xlsx", "xls", "csv"], accept_multiple_files=True)
 if not files:
-    st.info("Tip: an Excel export (or a PDF printed in landscape, 'fit to page') that includes "
-            "**Balance Qty** lets the app also check zero, low and overstock.")
+    head.markdown(ui.header(TITLE, SUB, [facility, f"Report date {report_date:%d/%m/%Y}"]),
+                  unsafe_allow_html=True)
+    html(ui.steps())
+    st.caption("Tip: an Excel export, or a PDF printed in landscape with 'fit to page', includes Balance Qty, "
+               "so the app can also flag zero, low and overstock.")
     st.stop()
 
 frames, problems = [], []
@@ -102,152 +112,152 @@ with st.spinner("Reading files…"):
 for p in problems:
     st.error(p)
 if not frames:
+    head.markdown(ui.header(TITLE, SUB, [facility]), unsafe_allow_html=True)
     st.stop()
 
 df = sc.combine(frames)
 res = sc.analyse(df, report_date, low_months, over_months)
 s = res["summary"]
-d = s["dup_counts"]
-e = s["expiry_counts"]
+d, e = s["dup_counts"], s["expiry_counts"]
+content = rp.build_content(res, report_date, facility)
+tables = {name: tbl for name, _, tbl in content["tables"]}
+descs = {name: desc for name, desc, _ in content["tables"]}
+
+head.markdown(ui.header(
+    TITLE + (f" – {facility}" if facility else ""), SUB,
+    [f"Report date {report_date:%d/%m/%Y}", f"{len(files)} file{'s' if len(files) > 1 else ''}",
+     f"{s['lines']} stock lines"]), unsafe_allow_html=True)
 
 # ----------------------------------------------------------------------------------
-# Summary
+# Overview
 # ----------------------------------------------------------------------------------
-st.subheader("Summary" + (f" – {facility}" if facility else ""))
+html(ui.section("Overview", "Each dosage of a medicine is counted as its own item"))
+html(ui.cards([
+    (s["lines"], "Stock lines", ""),
+    (s["medicine_names"], "Medicine names", ""),
+    (s["medicines"], "Total items (medicine + dosage)", ""),
+    (s["names_multi_dosage"], "Medicines with several dosages", "calm"),
+    (s["medicines_repeated"], "Duplicated items", "alert"),
+    (len(tables["Exact Duplicates"]), "Exact duplicate medicines", "alert"),
+    (e[sc.EXPIRED], "Expired lines", "alert"),
+    (e[sc.EXP_3M], "Expiring within 3 months", "alert"),
+]))
 
-st.markdown("**Items**")
-c = st.columns(4)
-c[0].metric("Stock lines in report", s["lines"])
-c[1].metric("Medicine names", s["medicine_names"], help="Each medicine name counted once, whatever its dosage.")
-c[2].metric("Total items (medicine + dosage)", s["medicines"],
-            help="Each dosage of a medicine is counted as its own item.")
-c[3].metric("Medicines with more than one dosage", s["names_multi_dosage"],
-            help="Counted separately – these are NOT duplicates. See the 'Same name, different dosage' tab.")
+exact, check = tables["Exact Duplicates"], tables["Other Entries to Check"]
+extra = int(exact["Copies"].sum() - len(exact)) if len(exact) else 0
+html(ui.section("Entries to correct in e-BMSIS",
+                "Same medicine and dosage entered more than once for the same batch"))
+html('<div class="msr-grid2">'
+     + ui.problem_list("Exact duplicate medicines",
+                       f"Same dosage, batch, expiry and supply type entered more than once. "
+                       f"Keep one line each: {extra} extra line{'s' if extra != 1 else ''} to remove.", exact)
+     + ui.problem_list("Other entries to check",
+                       "Same batch under two supply types, or with two expiry dates.", check, show_finding=True)
+     + "</div>")
 
-st.markdown("**Duplicates – same medicine + same dosage**")
-c = st.columns(4)
-c[0].metric("Items listed more than once", s["medicines_repeated"])
-c[1].metric("Lines in these items", s["dup_lines"])
-c[2].metric("Extra lines", s["extra_lines"], help="Lines beyond one line per item.")
-c[3].metric("Exact duplicate entries (lines)", d[sc.EXACT_DUP], help=sc.FINDING_ACTION[sc.EXACT_DUP])
-c = st.columns(4)
-c[0].metric("Same batch, 2 supply types (lines)", d[sc.SAME_BATCH_TYPES], help=sc.FINDING_ACTION[sc.SAME_BATCH_TYPES])
-c[1].metric("Same batch, different expiry (lines)", d[sc.EXPIRY_CONFLICT], help=sc.FINDING_ACTION[sc.EXPIRY_CONFLICT])
-c[2].metric("Different batches – normal (lines)", d[sc.MULTI_BATCH], help=sc.FINDING_ACTION[sc.MULTI_BATCH])
+html(ui.section("Analysis"))
+panels = [
+    ui.bars("Duplicate lines by finding", [
+        (sc.EXPIRY_CONFLICT, d[sc.EXPIRY_CONFLICT], "alert"),
+        (sc.EXACT_DUP, d[sc.EXACT_DUP], "alert"),
+        (sc.SAME_BATCH_TYPES, d[sc.SAME_BATCH_TYPES], "warn"),
+        (sc.MULTI_BATCH, d[sc.MULTI_BATCH], ""),
+    ]),
+    ui.bars("Lines by expiry status", [
+        (sc.EXPIRED, e[sc.EXPIRED], "alert"), (sc.EXP_3M, e[sc.EXP_3M], "warn"),
+        (sc.EXP_6M, e[sc.EXP_6M], "soft"), (sc.EXP_OK, e[sc.EXP_OK], ""),
+    ]),
+]
+if s["has_qty"]:
+    tone = {"Zero stock": "alert", "Zero usable stock (only expired)": "alert", "Low stock": "warn",
+            "Overstock": "soft", "OK": ""}
+    panels.append(ui.bars("Items by stock level", [
+        (k[2:], v, tone.get(k[2:], "")) for k, v in sorted(s["stock_counts"].items())]))
+html('<div class="msr-grid2">' + "".join(panels) + "</div>")
 
-st.markdown("**Expiry**")
-c = st.columns(4)
-c[0].metric("Expired lines", e[sc.EXPIRED])
-c[1].metric("Expiring ≤3 months", e[sc.EXP_3M])
-c[2].metric("Expiring ≤6 months", e[sc.EXP_6M])
-c[3].metric("OK", e[sc.EXP_OK])
-
-if not s["has_qty"]:
-    st.warning("No **Balance Qty** in the upload, so stock levels (zero / low / overstock) were not checked. "
-               "PDF printouts usually cut this column off – use the Excel export or print in landscape.")
+note_html = [ui.esc(n) for n in content["notes"]]
+note_html.append("<b>Exact duplicate</b> and <b>same batch, different expiry</b> lines need correcting in e-BMSIS. "
+                 "<b>Different batches</b> are normal: issue the earliest expiry first (FEFO).")
+html('<div class="msr-grid2">' + ui.summary_table(content["sections"]) + ui.notes(note_html) + "</div>")
 
 # ----------------------------------------------------------------------------------
 # Downloads
 # ----------------------------------------------------------------------------------
-st.markdown("**Download report**")
+html(ui.section("Download report", "Same content in all three formats"))
 stem = f"Medicine_Stock_Review_{report_date:%Y-%m-%d}"
 c = st.columns(3)
 with st.spinner("Preparing reports…"):
-    c[0].download_button("⬇️ PDF report", data=rp.pdf_report(res, report_date, facility),
-                         file_name=f"{stem}.pdf", mime="application/pdf",
-                         use_container_width=True, type="primary")
-    c[1].download_button("⬇️ Excel report", data=rp.excel_report(res, report_date, facility),
+    c[0].download_button("PDF report", data=rp.pdf_report(res, report_date, facility),
+                         file_name=f"{stem}.pdf", mime="application/pdf", type="primary",
+                         help="Printable report for filing or sharing.")
+    c[1].download_button("Excel workbook", data=rp.excel_report(res, report_date, facility),
                          file_name=f"{stem}.xlsx",
                          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                         use_container_width=True)
-    c[2].download_button("⬇️ Interactive report (HTML)", data=rp.html_report(res, report_date, facility),
-                         file_name=f"{stem}.html", mime="text/html", use_container_width=True,
-                         help="Opens in any web browser, also offline. Search, filter and sort every table.")
+                         help="One sheet per table, with filters.")
+    c[2].download_button("Interactive report", data=rp.html_report(res, report_date, facility),
+                         file_name=f"{stem}.html", mime="text/html",
+                         help="One file that opens in any web browser, also offline. Search, filter and sort.")
+
 
 # ----------------------------------------------------------------------------------
-# Detail tabs
+# Details
 # ----------------------------------------------------------------------------------
-DATE = st.column_config.DateColumn("Expiry Date", format="DD/MM/YYYY")
-COMMON = {
-    "row_no": st.column_config.NumberColumn("Row #", format="%d"),
-    "supply_type": "Supply Type", "item_name": "Item Name", "medicine": "Medicine", "dosage": "Dosage",
-    "batch": "Batch No.", "expiry": DATE,
-    "days_to_expiry": st.column_config.NumberColumn("Days Left", format="%d"),
-    "expiry_status": "Expiry Status", "balance_qty": "Balance Qty",
-    "duplicate_finding": "Finding", "group_id": "Group", "action": "What to do",
-    "lines": "Lines", "extra_lines": "Extra Lines", "batches": "Batches", "supply_types": "Supply Types",
-    "finding": "Main Finding", "expired_lines": "Expired Lines", "rows": "Rows", "duplicated": "Duplicated?",
-}
+def search(frame: pd.DataFrame, q: str) -> pd.DataFrame:
+    if not q:
+        return frame
+    text = frame.astype(str).agg(" ".join, axis=1)
+    return frame[text.str.contains(q, case=False, regex=False)]
 
 
-def show(frame, cols, height=480):
-    cols = [c for c in cols if c in frame.columns and not (c == "balance_qty" and not s["has_qty"])]
-    st.dataframe(frame[cols], column_config=COMMON, hide_index=True, use_container_width=True, height=height)
+html(ui.section("Details", "Search and filter each table"))
+names = ["Exact Duplicates", "Other Entries to Check", "Duplicate Summary", "Duplicate Detail",
+         "Same Name, Different Dosage", "Expiry Alerts"]
+if "Stock Level" in tables:
+    names.append("Stock Level")
+names.append("All Items")
+tabs = st.tabs([f"{n}  ({len(tables[n])})" for n in names])
 
-
-tab_names = ["🔁 Duplicate summary", "🔎 Duplicate detail", "💊 Same name, different dosage",
-             "⏰ Expiry alerts"] + (["📦 Stock level"] if s["has_qty"] else []) + ["📋 All items"]
-tabs = st.tabs(tab_names)
-
-with tabs[0]:
-    st.caption("One row per **medicine + dosage** that is listed on more than one line.")
-    ds = res["dup_summary"]
-    pick = st.multiselect("Main finding", sc.FINDING_ORDER, default=sc.FINDING_ORDER, key="f_sum")
-    show(ds[ds["finding"].isin(pick)], ["medicine", "dosage", "lines", "extra_lines", "batches",
-                                        "supply_types", "finding", "expired_lines", "rows"])
-
-with tabs[1]:
-    dups = res["duplicates"]
-    st.caption("Every line of the duplicated items, with what to do.")
-    choice = st.multiselect("Show findings", sc.FINDING_ORDER, default=sc.FINDING_ORDER, key="f_det")
-    # keep whole groups together: show a group if any of its lines has a chosen finding
-    groups = dups.loc[dups["duplicate_finding"].isin(choice), "group_id"].unique()
-    view = dups[dups["group_id"].isin(groups)]
-    st.write(f"{view['group_id'].nunique()} items, {len(view)} lines")
-    show(view, ["group_id", "medicine", "dosage", "row_no", "supply_type", "batch", "expiry", "expiry_status",
-                "balance_qty", "duplicate_finding", "action"])
-
-with tabs[2]:
-    nd = res["name_dosage"]
-    st.caption(f"{s['names_multi_dosage']} medicines are stocked in more than one dosage. Each dosage is "
-               "counted as a separate item – these are **not** duplicates. "
-               "'Duplicated?' shows whether that exact dosage is itself repeated.")
-    q = st.text_input("Search medicine", key="q_nd")
-    if q:
-        nd = nd[nd["medicine"].str.contains(q, case=False, regex=False)]
-    show(nd, ["medicine", "dosage", "lines", "duplicated", "rows"])
-
-with tabs[3]:
-    exp = res["expiry"]
-    pick = st.multiselect("Show", [sc.EXPIRED, sc.EXP_3M, sc.EXP_6M], default=[sc.EXPIRED, sc.EXP_3M, sc.EXP_6M])
-    show(exp[exp["expiry_status"].isin(pick)],
-         ["row_no", "medicine", "dosage", "batch", "supply_type", "expiry", "days_to_expiry", "expiry_status",
-          "balance_qty", "action"])
-
-i = 4
-if s["has_qty"]:
-    with tabs[i]:
-        stock = res["stock"].copy()
-        stock["stock_status"] = stock["stock_status"].str[2:]
-        st.caption("Quantities of the same medicine + dosage are added across batches "
-                   "(expired stock and exact duplicate lines are not counted as usable).")
-        if "monthly_use" not in stock:
-            st.info("Add an average monthly use (AMC) column to the upload to flag low and overstock. "
-                    "Without it, only zero stock is flagged.")
-        pick = st.multiselect("Show", sorted(stock["stock_status"].unique()),
-                              default=[x for x in sorted(stock["stock_status"].unique()) if x != "OK"])
-        st.dataframe(stock[stock["stock_status"].isin(pick)], hide_index=True, use_container_width=True,
-                     column_config={"item_name": "Item (medicine + dosage)", "balance_qty": "Usable Balance Qty",
-                                    "expired_qty": "Expired Qty", "monthly_use": "Monthly use",
-                                    "months_of_stock": "Months of stock", "stock_status": "Stock status",
-                                    "rows": "Rows"})
-    i += 1
-
-with tabs[i]:
-    q = st.text_input("Search medicine, dosage or batch", key="q_all")
-    view = res["all"]
-    if q:
-        view = view[view["item_name"].str.contains(q, case=False, regex=False)
-                    | view["batch"].str.contains(q, case=False, regex=False)]
-    show(view, ["row_no", "supply_type", "medicine", "dosage", "batch", "expiry", "days_to_expiry",
-                "expiry_status", "balance_qty", "duplicate_finding"], height=560)
+for tab, name in zip(tabs, names):
+    t = tables[name]
+    with tab:
+        st.caption(descs[name])
+        a, b = st.columns([2, 1])
+        q = a.text_input("Search", key=f"q-{name}", placeholder="Search medicine, dosage, batch …",
+                         label_visibility="collapsed")
+        view = t
+        if name == "Duplicate Summary":
+            pick = b.multiselect("Main finding", sc.FINDING_ORDER, default=sc.FINDING_ORDER, key="f-sum",
+                                 label_visibility="collapsed", placeholder="Main finding")
+            view = view[view["Main Finding"].isin(pick)]
+        elif name == "Duplicate Detail":
+            pick = b.multiselect("Finding", sc.FINDING_ORDER, default=sc.FINDING_ORDER, key="f-det",
+                                 label_visibility="collapsed", placeholder="Finding")
+            groups = view.loc[view["Finding"].isin(pick), "Group"].unique()   # keep whole items together
+            view = view[view["Group"].isin(groups)]
+        elif name == "Same Name, Different Dosage":
+            pick = b.selectbox("Show", ["All dosages", "Only repeated dosages", "Only single-line dosages"],
+                               key="f-nd", label_visibility="collapsed")
+            if pick == "Only repeated dosages":
+                view = view[view["Duplicated?"].str.startswith("Yes")]
+            elif pick == "Only single-line dosages":
+                view = view[view["Duplicated?"] == "No"]
+        elif name == "Expiry Alerts":
+            opts = [sc.EXPIRED, sc.EXP_3M, sc.EXP_6M]
+            pick = b.multiselect("Status", opts, default=opts, key="f-exp", label_visibility="collapsed",
+                                 placeholder="Expiry status")
+            view = view[view["Expiry Status"].isin(pick)]
+        elif name == "Stock Level":
+            opts = sorted(view["Stock Status"].unique())
+            pick = b.multiselect("Status", opts, default=[o for o in opts if o != "OK"] or opts, key="f-stk",
+                                 label_visibility="collapsed", placeholder="Stock status")
+            view = view[view["Stock Status"].isin(pick)]
+        elif name == "All Items":
+            pick = b.selectbox("Show", ["All lines", "Only duplicated items", "Only expiry alerts"], key="f-all",
+                               label_visibility="collapsed")
+            if pick == "Only duplicated items":
+                view = view[view["Duplicate Finding"] != ""]
+            elif pick == "Only expiry alerts":
+                view = view[view["Expiry Status"].isin([sc.EXPIRED, sc.EXP_3M, sc.EXP_6M])]
+        view = search(view, q)
+        html(ui.count(len(view), len(t)))
+        html(ui.table(view, group_col="Group" if name == "Duplicate Detail" else None))
